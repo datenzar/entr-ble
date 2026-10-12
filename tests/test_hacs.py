@@ -22,6 +22,7 @@ from homeassistant.components.lock.const import LockState
 from homeassistant.components.sensor import RestoreSensor
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -324,6 +325,35 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(schema)
         assert schema is not None
         self.assertEqual(schema({CONF_ADDRESS: "AA:BB"}), {CONF_ADDRESS: "AA:BB"})
+
+    async def test_discovery_with_no_devices_offers_retry_or_manual_entry(self):
+        flow = config_flow.EntrConfigFlow()
+        flow.hass = cast(HomeAssistant, object())
+        unrelated = SimpleNamespace(
+            address="CC:DD", manufacturer_data={}, local_name="Speaker", rssi=-50
+        )
+        for discovered in ([], [unrelated]):
+            with (
+                self.subTest(discovered=len(discovered)),
+                patch.object(bluetooth, "async_request_active_scan", AsyncMock()),
+                patch.object(
+                    bluetooth, "async_discovered_service_info", return_value=discovered
+                ),
+            ):
+                result = await flow.async_step_discover()
+                self.assertIs(result.get("type"), FlowResultType.MENU)
+                self.assertEqual(result.get("step_id"), "no_devices")
+                self.assertEqual(result.get("menu_options"), ["discover", "manual"])
+                # FlowManager rejects any shown step or menu option without a
+                # matching handler with UnknownStep, which surfaced as "Error".
+                for step_id in ("no_devices", "discover", "manual"):
+                    self.assertTrue(
+                        callable(getattr(flow, f"async_step_{step_id}", None)),
+                        step_id,
+                    )
+        menu = await flow.async_step_no_devices()
+        self.assertEqual(menu.get("step_id"), "no_devices")
+        self.assertEqual(menu.get("menu_options"), ["discover", "manual"])
 
     async def test_provisioning_modes_disconnect_and_store_separate_credentials(self):
         FakeClient.instances.clear()
