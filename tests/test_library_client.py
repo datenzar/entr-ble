@@ -3,7 +3,9 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from entr_ble import EntrLockClient, EntrLockError, EntrProtocolError, const
+from entr_ble.client.access import OperationStatus
 from entr_ble.client.fields import decode_status
+from entr_ble.client.transport import EntrConnectionLostError
 from entr_ble.crypto import derive_session_key, generate_keypair, public_key_bytes
 from entr_ble.framing import build_control_frame, build_payload_chunks
 from entr_ble.session_crypto import SessionCrypto
@@ -15,6 +17,34 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with patch("entr_ble.client.transport.BleakClient", return_value=self.bleak):
             self.client = EntrLockClient("AA:BB")
         self.client.session = SessionCrypto(bytes(16))
+        self.client._connected = True
+
+    async def test_disconnect_fails_pending_command_immediately(self):
+        async def drop_link(*_args, **_kwargs):
+            self.client.handle_disconnect(self.bleak)
+
+        self.bleak.write_gatt_char.side_effect = drop_link
+        with self.assertRaises(EntrConnectionLostError):
+            await asyncio.wait_for(self.client._send_raw(120, b"\x01"), 1)
+        # Later commands fail before touching the link.
+        self.bleak.write_gatt_char.reset_mock()
+        with self.assertRaises(EntrConnectionLostError):
+            await self.client._send_raw(120, b"\x01")
+        self.bleak.write_gatt_char.assert_not_awaited()
+
+    async def test_intentional_disconnect_does_not_queue_error(self):
+        await self.client.disconnect()
+        self.client.handle_disconnect(self.bleak)
+        self.assertTrue(self.client._responses.empty())
+
+    async def test_connect_reuses_injected_connected_client(self):
+        injected = AsyncMock()
+        injected.is_connected = True
+        await self.client.connect(injected)
+        self.assertIs(self.client.client, injected)
+        injected.connect.assert_not_awaited()
+        self.assertEqual(injected.start_notify.await_count, 4)
+        self.assertTrue(self.client.fota_available)
 
     async def test_chunked_notifications_reassemble_once(self):
         payload = bytes(range(144))
@@ -175,6 +205,46 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client._exchange_encrypted.return_value = (44, b"unrelated")
         with self.assertRaises(EntrProtocolError):
             await self.client.unlock(bytes(16), bytes(16), bytes(32))
+
+    async def test_operations_return_parsed_op_status(self):
+        self.client._exchange_encrypted = AsyncMock(
+            return_value=(25, bytes([25, 7, 2, 0xAB, 0xCD, 0xFF]))
+        )
+        self.assertEqual(
+            await self.client.unlock(bytes(16), bytes(16), bytes(32)),
+            OperationStatus(type_id=7, value=b"\xab\xcd"),
+        )
+        for payload in (b"", bytes([25, 7]), bytes([25, 7, 0]), bytes([25, 7, 3, 1])):
+            with self.subTest(payload=payload):
+                self.client._exchange_encrypted.return_value = (25, payload)
+                self.assertIsNone(
+                    await self.client.lock(bytes(16), bytes(16), bytes(32))
+                )
+        self.client._exchange_encrypted.return_value = (120, bytes([101, 18]))
+        self.assertIsNone(await self.client.lock(bytes(16), bytes(16), bytes(32)))
+
+    async def test_idle_status_read_retries_only_while_busy(self):
+        config = {"locked": True}
+        self.client.get_device_config = AsyncMock(
+            side_effect=[EntrLockError(4, 23), EntrLockError(4, 23), config]
+        )
+        with patch("entr_ble.client.status.asyncio.sleep", AsyncMock()) as sleep:
+            self.assertEqual(await self.client.get_device_config_when_idle(), config)
+        self.assertEqual(sleep.await_count, 3)
+        self.client.get_device_config = AsyncMock(side_effect=EntrLockError(4, 27))
+        with (
+            patch("entr_ble.client.status.asyncio.sleep", AsyncMock()),
+            self.assertRaises(EntrLockError),
+        ):
+            await self.client.get_device_config_when_idle()
+        self.assertEqual(self.client.get_device_config.await_count, 1)
+        self.client.get_device_config = AsyncMock(side_effect=EntrLockError(4, 23))
+        with (
+            patch("entr_ble.client.status.asyncio.sleep", AsyncMock()),
+            self.assertRaises(EntrLockError),
+        ):
+            await self.client.get_device_config_when_idle(attempts=2)
+        self.assertEqual(self.client.get_device_config.await_count, 2)
 
     async def test_truncated_success_is_not_confirmation(self):
         for command, payload in ((101, b""), (101, b"e"), (120, b"e")):

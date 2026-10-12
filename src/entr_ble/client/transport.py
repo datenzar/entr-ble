@@ -65,6 +65,8 @@ ERROR_DETAILS = {
     41: "MAXIMUM_PENDING_USERS",
 }
 
+LOCK_BUSY = 23
+
 ERROR_CATEGORIES = {
     1: "BadInput",
     2: "InsufficientResources",
@@ -94,6 +96,10 @@ class EntrLockError(EntrProtocolError):
         super().__init__(f"lock returned error: {category_name} / {detail_name}")
 
 
+class EntrConnectionLostError(EntrProtocolError):
+    """The BLE link dropped before or while waiting for a response."""
+
+
 class TransportClient:
     """BLE connection and session state shared by the command mixins.
 
@@ -113,7 +119,10 @@ class TransportClient:
         finished.
         """
         self.address = device.address if isinstance(device, BLEDevice) else device
-        self.client = BleakClient(device, timeout=timeout)
+        self.client = BleakClient(
+            device, disconnected_callback=self.handle_disconnect, timeout=timeout
+        )
+        self._connected = False
         self.private_key = crypto.generate_keypair()
         self.session: SessionCrypto | None = None
         self.comm_version = ""
@@ -132,15 +141,22 @@ class TransportClient:
         self._primary = ChunkAssembler()
         self.fota_available = False
 
-    async def connect(self) -> None:
+    async def connect(self, client: BleakClient | None = None) -> None:
         """Connect and subscribe to lock responses; return None.
 
-        Sets fota_available according to whether optional FOTA notifications can be
-        enabled. Failure to enable those optional notifications does not prevent
-        ordinary commands; connection and required notification failures propagate from
-        Bleak.
+        Pass an already connected client (for example one returned by
+        bleak_retry_connector.establish_connection, created with
+        disconnected_callback=self.handle_disconnect) to reuse it instead of the
+        internal BleakClient. Sets fota_available according to whether optional FOTA
+        notifications can be enabled. Failure to enable those optional notifications
+        does not prevent ordinary commands; connection and required notification
+        failures propagate from Bleak.
         """
-        await self.client.connect()
+        if client is not None:
+            self.client = client
+        if not self.client.is_connected:
+            await self.client.connect()
+        self._connected = True
         await self.client.start_notify(const.RESPONSE_CONTROL, self._on_control)
         await self.client.start_notify(const.RESPONSE_PRIMARY_PAYLOAD, self._on_primary)
         # The FOTA service carries device info / errors / firmware updates; it
@@ -162,7 +178,19 @@ class TransportClient:
         Cached session and status remain on this object. Restore the session with
         kdf_resync() after reconnecting before sending encrypted commands.
         """
+        self._connected = False
         await self.client.disconnect()
+
+    def handle_disconnect(self, _client: BleakClient | None = None) -> None:
+        """Bleak disconnected_callback: fail the in-flight command immediately.
+
+        Without this, a dropped link would only surface after the response timeout.
+        """
+        if not self._connected:
+            return
+        self._connected = False
+        self._pending_command = None
+        self._queue(EntrConnectionLostError(f"lost connection to {self.address}"))
 
     def _on_control(self, _char, data: bytes | bytearray) -> None:
         try:
@@ -252,6 +280,8 @@ class TransportClient:
         payload_char = (
             const.FOTA_REQUEST_CHAR_PAYLOAD if fota else const.REQUEST_CHAR_PAYLOAD
         )
+        if not self._connected:
+            raise EntrConnectionLostError(f"not connected to {self.address}")
         # Drop anything left over from a previous exchange.
         while not self._responses.empty():
             self._responses.get_nowait()

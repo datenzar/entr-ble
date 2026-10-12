@@ -1,9 +1,16 @@
+import asyncio
 from typing import TypedDict
 
 import entr_ble.const as const
 
 from .fields import StatusData, decode_status
-from .transport import EntrProtocolError, TransportClient, validate_response
+from .transport import (
+    LOCK_BUSY,
+    EntrLockError,
+    EntrProtocolError,
+    TransportClient,
+    validate_response,
+)
 
 
 class LockSerial(TypedDict):
@@ -101,3 +108,22 @@ class Status(TransportClient):
             return niz_config
         self.status = config
         return config
+
+    async def get_device_config_when_idle(
+        self, attempts: int = 4, delay: float = 1.5
+    ) -> DeviceConfig:
+        """Read GET_DEVICE_CONFIG, retrying while the lock reports LockBusy.
+
+        Use after LOCK/UNLOCK: the motor keeps running after the command is
+        confirmed, and the lock rejects status reads with LockBusy (23) meanwhile.
+        Waits ``delay`` seconds before each attempt; other errors propagate
+        immediately and the last LockBusy error propagates after ``attempts`` tries.
+        """
+        for attempt in range(1, attempts + 1):
+            await asyncio.sleep(delay)
+            try:
+                return await self.get_device_config()
+            except EntrLockError as exc:
+                if exc.detail != LOCK_BUSY or attempt == attempts:
+                    raise
+        raise AssertionError("unreachable")

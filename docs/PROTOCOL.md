@@ -14,7 +14,11 @@ Advertisements include product id `0xE7`. The next byte contains the advertiseme
 
 ECDH uses secp256r1. The client sends a 64-byte raw public key (`x‖y`, command 10); the lock returns a public key and IV. The session key is `SHA-256(shared secret)[:16]`. Sensitive commands use AES-128-CBC with PKCS7 padding inside command 120 (`GENERAL_ENCRYPTED`). The first IV byte travels with each message, while the remaining 15 bytes stay fixed for the session.
 
+The SEND_PUBLIC_KEY response is `aes_public_key(64) ‖ ecdsa_public_key(64) ‖ iv(16)`. Both keys are raw secp256r1 points; only the first takes part in ECDH.
+
 Connections using saved credentials resynchronize through KDF command 14 with `[kdf_id, role]`. The lock returns a fresh IV, signature and status. A client must retain the AES key, KDF id, application id, user id and lock key needed for later connections.
+
+The 72-byte `BLE_SIGNATURE` field (also returned after HANDSHAKE1) is sized for a DER-encoded ECDSA signature, presumably by the ECDSA key from SEND_PUBLIC_KEY. The signed message is unknown: the official app (ENTR 1.8.7.5, `com.multlock.multilocksdk`) stores the ECDSA key and parses the signature but never verifies it. Its only verification routine uses `NONEwithECDSA` with a placeholder message. Clients therefore cannot authenticate the lock, and the ciphertext carries no MAC. An attacker within radio range that impersonates the lock is not detected.
 
 ## Ownership and users
 
@@ -49,7 +53,7 @@ OP_DEVICE_CONFIG sends `app_id(16) ‖ prev_admin_code(6) ‖ admin_code(6) ‖ 
 
 Mechanical calibration adds `door_direction(1) ‖ lock_type(1)`: left 1, right 3, normal 0 and lift 2. Magnet calibration uses an extra byte, normally 0. Settings, calibration, reset and time commands confirm success with OP_SUCCESS_EXP (101), which echoes the command id.
 
-UNLOCK and LOCK return cleartext OP_STATUS (25); failures return OP_ERROR (102) with a category and detail code. On EURO firmware, UNLOCK actuates a spring latch and can be useful even when the status reports unlocked. The reported locked bit may remain stale after manual operation.
+UNLOCK and LOCK return cleartext OP_STATUS (25) with `command(1) ‖ status_type_id(1) ‖ value_length(1) ‖ value`; failures return OP_ERROR (102) with a category and detail code. The official app logs OP_STATUS without interpreting it, and the status type ids are undocumented. Clients that need the resulting lock state should read GET_DEVICE_CONFIG after the motor has finished; the lock may reply LockBusy (23) while it is still moving. On EURO firmware, UNLOCK actuates a spring latch and can be useful even when the status reports unlocked. The reported locked bit may remain stale after manual operation.
 
 ## Status and firmware variants
 
