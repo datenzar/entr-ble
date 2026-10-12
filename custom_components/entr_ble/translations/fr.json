@@ -106,5 +106,18 @@
       "invalid_input": "Vérifiez le code et le nom de la serrure.",
       "pairing_rejected": "La serrure a refusé le code ou la méthode de configuration."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options de la serrure ENTR",
+        "data": {
+          "scan_interval": "Intervalle d'actualisation de l'état"
+        },
+        "data_description": {
+          "scan_interval": "Minutes entre deux lectures de l'état en arrière-plan (verrou, porte, batterie). Chaque lecture établit une courte connexion Bluetooth et consomme un peu de batterie. Indiquez 0 pour ne lire l'état qu'après une commande et lorsque la serrure réapparaît."
+        }
+      }
+    }
   }
 }

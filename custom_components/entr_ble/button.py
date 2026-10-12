@@ -3,23 +3,16 @@ from typing import override
 from homeassistant.components.button import ButtonEntity
 from homeassistant.const import EntityCategory
 
-from .const import CONF_ADDRESS
-from .entity import device_info
+from .entity import EntrEntity
 
 
-class EntrCommandButton(ButtonEntity):
-    _attr_has_entity_name = True
-    _attr_should_poll = False
-
+class EntrCommandButton(EntrEntity, ButtonEntity):  # pyright: ignore[reportIncompatibleVariableOverride]
     def __init__(self, entry, command):
-        self._device = entry.runtime_data
+        super().__init__(entry, f"{command}_button")
         self._command = command
-        address = entry.data[CONF_ADDRESS]
-        self._attr_unique_id = f"{address}_{command}_button"
         self._attr_name = command.capitalize()
         if command == "sync":
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
-        self._attr_device_info = device_info(entry)
 
     @override
     async def async_press(self):

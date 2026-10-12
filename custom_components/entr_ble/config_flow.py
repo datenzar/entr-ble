@@ -5,7 +5,11 @@ import voluptuous as vol
 from bleak.exc import BleakError
 from homeassistant import config_entries
 from homeassistant.components import bluetooth
+from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -23,8 +27,11 @@ from .const import (
     CONF_KDF_ID,
     CONF_LOCK_NAME,
     CONF_ROLE,
+    CONF_SCAN_INTERVAL,
     CONF_USER_ID,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MAX_SCAN_INTERVAL,
 )
 from .provisioning import async_provision
 
@@ -55,6 +62,11 @@ class EntrConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def __init__(self):
         self._address = None
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return EntrOptionsFlow()
 
     async def async_step_user(self, user_input=None):
         return self.async_show_menu(
@@ -211,6 +223,39 @@ class EntrConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return None, "pairing_rejected"
         except BleakError, EntrProtocolError, OSError, TimeoutError:
             return None, "cannot_connect"
+
+
+class EntrOptionsFlow(config_entries.OptionsFlowWithReload):
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                _options_schema(),
+                {
+                    CONF_SCAN_INTERVAL: self.config_entry.options.get(
+                        CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+                    )
+                },
+            ),
+        )
+
+
+def _options_schema():
+    return vol.Schema(
+        {
+            vol.Required(CONF_SCAN_INTERVAL): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=MAX_SCAN_INTERVAL,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="min",
+                )
+            ),
+        }
+    )
 
 
 def _credentials(user_input):

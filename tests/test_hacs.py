@@ -5,14 +5,18 @@ import io
 import json
 import sys
 import unittest
+from collections.abc import Callable
+from contextlib import contextmanager
+from datetime import timedelta
 from types import ModuleType, SimpleNamespace
 from typing import ClassVar, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 from bleak.exc import BleakError
 from entr_ble_cli.commands import config
 from entr_ble_cli.store import LockCredentials
 from homeassistant import components
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.lock import LockEntityFeature
 from homeassistant.components.lock.const import LockState
 from homeassistant.components.sensor import RestoreSensor
@@ -30,14 +34,24 @@ bluetooth.__dict__.update(
         "async_ble_device_from_address": Mock(return_value=object()),
         "async_request_active_scan": AsyncMock(),
         "async_discovered_service_info": Mock(return_value=[]),
+        "async_register_callback": Mock(return_value=Mock()),
+        "async_track_unavailable": Mock(return_value=Mock()),
+        "BluetoothCallbackMatcher": dict,
+        "BluetoothScanningMode": SimpleNamespace(PASSIVE="passive"),
     }
 )
 components.__dict__["bluetooth"] = bluetooth
 sys.modules[bluetooth.__name__] = bluetooth
 
-from custom_components.entr_ble import api, config_flow, provisioning
+from custom_components.entr_ble import api, config_flow, connection, provisioning
+from custom_components.entr_ble.binary_sensor import EntrStatusBinarySensor, _door_open
 from custom_components.entr_ble.button import EntrCommandButton
-from custom_components.entr_ble.const import CONF_ADDRESS, CONF_AES_KEY, CONF_ROLE
+from custom_components.entr_ble.const import (
+    CONF_ADDRESS,
+    CONF_AES_KEY,
+    CONF_ROLE,
+    CONF_SCAN_INTERVAL,
+)
 from custom_components.entr_ble.lock import EntrLock
 from custom_components.entr_ble.sensor import EntrBattery
 
@@ -51,11 +65,15 @@ class FakeClient:
         self.comm_version = "1.29r3"
         self.session = SimpleNamespace(key=b"\x11" * 16)
         self.status = {"battery_percentage": 73, "locked": False}
+        self.read_back: dict[str, object] | Exception | None = None
         self.calls = []
         self.instances.append(self)
 
-    async def connect(self):
+    async def connect(self, client=None):
         self.calls.append("connect")
+
+    def handle_disconnect(self, _client=None):
+        self.calls.append("lost")
 
     async def disconnect(self):
         self.calls.append("disconnect")
@@ -91,9 +109,50 @@ class FakeClient:
 
     async def lock(self, *_args):
         self.calls.append("lock")
+        self.status = {**self.status, "locked": True}
 
     async def unlock(self, *_args):
         self.calls.append("unlock")
+        self.status = {**self.status, "locked": False}
+
+    async def get_device_config_when_idle(self):
+        self.calls.append("read")
+        if isinstance(self.read_back, Exception):
+            raise self.read_back
+        return self.read_back or {**self.status, "battery_percentage": None}
+
+
+CREDENTIALS = {
+    CONF_ADDRESS: "AA:BB",
+    "kdf_id": 3,
+    "role": 0,
+    CONF_AES_KEY: "11" * 16,
+    "user_id": "33" * 16,
+    "app_id": "aa" * 16,
+    "ble_ekey": "22" * 32,
+}
+
+
+@contextmanager
+def fake_connection(client_factory: Callable[..., FakeClient] = FakeClient):
+    """Route connection.async_connect through FakeClient without real Bluetooth."""
+    bleak_client = Mock(disconnect=AsyncMock())
+    with (
+        patch.object(
+            connection, "establish_connection", AsyncMock(return_value=bleak_client)
+        ) as establish,
+        patch.object(connection, "EntrLockClient", client_factory),
+    ):
+        yield establish
+
+
+def fake_hass():
+    tasks = []
+    hass = SimpleNamespace(
+        tasks=tasks,
+        async_create_background_task=lambda task, _name: tasks.append(task),
+    )
+    return cast(HomeAssistant, hass)
 
 
 class HacsTests(unittest.IsolatedAsyncioTestCase):
@@ -195,20 +254,15 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         listeners = []
-        reads = []
         device = SimpleNamespace(
             locked=None,
+            available=True,
             add_listener=lambda listener: listeners.append(listener) or (lambda: None),
             async_lock=AsyncMock(),
             async_unlock=AsyncMock(),
             async_sync=AsyncMock(),
-            async_read_status=AsyncMock(),
         )
-        entry = SimpleNamespace(
-            data={CONF_ADDRESS: "AA:BB"},
-            runtime_data=device,
-            async_create_background_task=lambda _hass, task, _name: reads.append(task),
-        )
+        entry = SimpleNamespace(data={CONF_ADDRESS: "AA:BB"}, runtime_data=device)
         lock = EntrLock(entry)
         with (
             patch.object(RestoreEntity, "async_added_to_hass", AsyncMock()),
@@ -222,12 +276,15 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
         ):
             await lock.async_added_to_hass()
             self.assertTrue(lock.is_locked)
-            await reads[0]
-            device.async_read_status.assert_awaited_once()
-            self.assertTrue(lock.is_locked)
+            self.assertTrue(lock.available)
             device.locked = False
             listeners[0]()
             self.assertFalse(lock.is_locked)
+            device.available = False
+            listeners[0]()
+            self.assertFalse(lock.available)
+            self.assertFalse(lock.is_locked)
+            device.available = True
             self.assertTrue(lock.supported_features & LockEntityFeature.OPEN)
             await lock.async_open()
             device.async_unlock.assert_awaited_once()
@@ -271,7 +328,7 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
     async def test_provisioning_modes_disconnect_and_store_separate_credentials(self):
         FakeClient.instances.clear()
         with (
-            patch.object(provisioning, "EntrLockClient", FakeClient),
+            fake_connection(),
             patch.object(provisioning.os, "urandom", return_value=b"\xaa" * 16),
         ):
             owner = await provisioning.async_provision(
@@ -341,7 +398,7 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_battery_restores_last_value_without_polling(self):
         device = SimpleNamespace(
-            status=None, add_listener=lambda _listener: lambda: None
+            status=None, available=True, add_listener=lambda _listener: lambda: None
         )
         entry = SimpleNamespace(data={CONF_ADDRESS: "AA:BB"}, runtime_data=device)
         sensor = EntrBattery(entry)
@@ -365,41 +422,59 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sensor.native_value, 73)
         self.assertFalse(sensor.should_poll)
 
-    async def test_lock_action_disconnects_and_updates_battery_from_session(self):
+    async def test_lock_action_reads_back_state_and_keeps_session_battery(self):
         FakeClient.instances.clear()
-        credentials = {
-            CONF_ADDRESS: "AA:BB",
-            "kdf_id": 3,
-            "role": 0,
-            CONF_AES_KEY: "11" * 16,
-            "user_id": "33" * 16,
-            "app_id": "aa" * 16,
-            "ble_ekey": "22" * 32,
-        }
-        device = api.EntrDevice(object(), credentials)
-        with patch.object(api, "EntrLockClient", FakeClient):
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        updates = []
+        device.add_listener(lambda: updates.append(device.locked))
+        with fake_connection() as establish:
             await device.async_lock()
-        self.assertIsNotNone(device.status)
+        establish.assert_awaited_once()
+        self.assertIs(
+            establish.call_args.kwargs["disconnected_callback"].__self__,
+            FakeClient.instances[0],
+        )
         assert device.status is not None
         self.assertEqual(device.status["battery_percentage"], 73)
         self.assertTrue(device.locked)
+        self.assertEqual(updates, [True, True])
         self.assertEqual(
-            FakeClient.instances[0].calls, ["connect", "kdf", "lock", "disconnect"]
+            FakeClient.instances[0].calls,
+            ["connect", "kdf", "lock", "read", "disconnect"],
         )
+
+    async def test_read_back_reports_what_the_lock_actually_did(self):
+        def jammed(device, timeout):
+            client = FakeClient(device, timeout)
+            client.read_back = {"locked": False, "battery_percentage": 70}
+            return client
+
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        with fake_connection(jammed):
+            await device.async_lock()
+        self.assertFalse(device.locked)
+        assert device.status is not None
+        self.assertEqual(device.status["battery_percentage"], 70)
+
+    async def test_failed_read_back_keeps_assumed_state(self):
+        def busy(device, timeout):
+            client = FakeClient(device, timeout)
+            client.read_back = api.EntrProtocolError("LockBusy")
+            return client
+
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        with fake_connection(busy):
+            await device.async_lock()
+        self.assertTrue(device.locked)
+        self.assertTrue(device.last_update_success)
 
     async def test_startup_read_and_sync_use_reported_state(self):
         FakeClient.instances.clear()
-        credentials = {
-            CONF_ADDRESS: "AA:BB",
-            "kdf_id": 3,
-            "role": 0,
-            CONF_AES_KEY: "11" * 16,
-        }
-        device = api.EntrDevice(object(), credentials)
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
         updates = []
         device.add_listener(lambda: updates.append(device.status))
-        with patch.object(api, "EntrLockClient", FakeClient):
-            await device.async_read_status()
+        with fake_connection():
+            await device.async_refresh()
             self.assertFalse(device.locked)
             assert device.status is not None
             self.assertEqual(device.status["battery_percentage"], 73)
@@ -411,51 +486,60 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
             [["connect", "kdf", "disconnect"], ["connect", "kdf", "disconnect"]],
         )
 
-    async def test_inaccessible_startup_read_keeps_restored_values(self):
-        device = api.EntrDevice(object(), {CONF_ADDRESS: "AA:BB"})
-        device.status = decode_status(0, 64, None)
-        with patch.object(
-            bluetooth, "async_ble_device_from_address", return_value=None
+    async def test_out_of_range_lock_becomes_unavailable_and_keeps_values(self):
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        device.status = dict(decode_status(0, 64, None))
+        with (
+            patch.object(bluetooth, "async_ble_device_from_address", return_value=None),
+            self.assertLogs(api._LOGGER, "WARNING") as logs,
         ):
-            await device.async_read_status()
+            await device.async_refresh()
+            await device.async_refresh()
+            with self.assertRaisesRegex(HomeAssistantError, "not in Bluetooth range"):
+                await device.async_lock()
+        self.assertEqual(len(logs.records), 1)
         assert device.status is not None
         self.assertEqual(device.status["battery_percentage"], 64)
         self.assertIsNone(device.locked)
+        self.assertFalse(device.available)
+        self.assertFalse(device.last_update_success)
+
+        with fake_connection(), self.assertLogs(api._LOGGER, "INFO") as logs:
+            await device.async_sync()
+        self.assertIn("responding again", logs.output[0])
+        self.assertTrue(device.available)
 
     async def test_failed_session_disconnects_without_changing_lock_state(self):
-        device = api.EntrDevice(
-            object(),
-            {CONF_ADDRESS: "AA:BB", "kdf_id": 3, "role": 0, CONF_AES_KEY: "11" * 16},
-        )
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
         device.locked = False
         listener = Mock()
         device.add_listener(listener)
         client = FakeClient(object(), 15)
         with (
-            patch.object(api, "EntrLockClient", return_value=client),
+            fake_connection(Mock(return_value=client)),
             patch.object(client, "kdf_resync", side_effect=BleakError("Lost link")),
-            self.assertRaises(HomeAssistantError),
+            self.assertLogs(api._LOGGER, "WARNING"),
+            self.assertRaisesRegex(HomeAssistantError, "Lost link"),
         ):
             await device.async_lock()
         self.assertFalse(device.locked)
+        self.assertTrue(device.available)
         self.assertEqual(client.calls, ["connect", "disconnect"])
         listener.assert_called_once()
 
     async def test_parallel_sessions_wait_and_cancelled_session_disconnects(self):
-        device = api.EntrDevice(
-            object(),
-            {CONF_ADDRESS: "AA:BB", "kdf_id": 3, "role": 0, CONF_AES_KEY: "11" * 16},
-        )
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
         connected = asyncio.Event()
         release = asyncio.Event()
         client = FakeClient(object(), 15)
 
-        async def connect():
+        async def connect(_bleak_client=None):
             connected.set()
             await release.wait()
 
+        factory = Mock(return_value=client)
         with (
-            patch.object(api, "EntrLockClient", return_value=client) as factory,
+            fake_connection(factory) as establish,
             patch.object(client, "connect", side_effect=connect),
         ):
             first = asyncio.create_task(device.async_sync())
@@ -466,10 +550,141 @@ class HacsTests(unittest.IsolatedAsyncioTestCase):
             first.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await first
+            bleak_client = establish.return_value
+            bleak_client.disconnect.assert_awaited_once()
             release.set()
             await asyncio.wait_for(second, 1)
         self.assertEqual(factory.call_count, 2)
-        self.assertEqual(client.calls, ["disconnect", "kdf", "disconnect"])
+        self.assertEqual(client.calls, ["kdf", "disconnect"])
+
+    async def test_poll_is_skipped_while_a_session_is_running(self):
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        with patch.object(device, "async_refresh", AsyncMock()) as refresh:
+            async with device._lock:
+                await device._async_poll()
+            refresh.assert_not_awaited()
+            await device._async_poll()
+            refresh.assert_awaited_once()
+
+    async def test_unlock_with_auto_lock_follows_up_until_locked(self):
+        def auto_lock(device, timeout):
+            client = FakeClient(device, timeout)
+            client.status = {**client.status, "auto_lock": True}
+            return client
+
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        cancel = Mock()
+        with (
+            fake_connection(auto_lock),
+            patch.object(api, "async_call_later", return_value=cancel) as later,
+        ):
+            await device.async_unlock()
+            self.assertFalse(device.locked)
+            self.assertEqual(later.call_args.args[1], api.AUTO_LOCK_FOLLOW_UPS[0])
+
+            # Still unlocked at the first follow-up: schedule the next one.
+            await later.call_args.args[2](None)
+            self.assertEqual(later.call_count, 2)
+            self.assertEqual(later.call_args.args[1], api.AUTO_LOCK_FOLLOW_UPS[1])
+
+            # A manual lock cancels the pending follow-up and stops the chain.
+            await device.async_lock()
+            cancel.assert_called_once()
+            await later.call_args.args[2](None)
+            self.assertEqual(later.call_count, 2)
+
+    async def test_unlock_without_auto_lock_does_not_follow_up(self):
+        device = api.EntrDevice(fake_hass(), CREDENTIALS)
+        with (
+            fake_connection(),
+            patch.object(api, "async_call_later") as later,
+        ):
+            await device.async_unlock()
+        later.assert_not_called()
+
+    async def test_presence_tracking_and_polling_subscriptions(self):
+        hass = fake_hass()
+        device = api.EntrDevice(hass, CREDENTIALS)
+        unsubscribers = [Mock(), Mock(), Mock()]
+        updates = Mock()
+        device.add_listener(updates)
+        with (
+            patch.object(
+                bluetooth, "async_register_callback", return_value=unsubscribers[0]
+            ) as register,
+            patch.object(
+                bluetooth, "async_track_unavailable", return_value=unsubscribers[1]
+            ),
+            patch.object(
+                api, "async_track_time_interval", return_value=unsubscribers[2]
+            ) as interval,
+        ):
+            device.async_start(timedelta(minutes=10))
+        self.assertEqual(register.call_args.args[2]["address"], "AA:BB")
+        self.assertEqual(interval.call_args.args[2], timedelta(minutes=10))
+
+        device._async_advertisement(None, None)
+        updates.assert_not_called()
+        device._async_unavailable(None)
+        self.assertFalse(device.available)
+        device._async_unavailable(None)
+        self.assertEqual(updates.call_count, 1)
+        with patch.object(device, "async_refresh", AsyncMock()) as refresh:
+            device._async_advertisement(None, None)
+            self.assertTrue(device.available)
+            await cast(SimpleNamespace, hass).tasks[0]
+            refresh.assert_awaited_once()
+
+        device.async_stop()
+        for unsubscribe in unsubscribers:
+            unsubscribe.assert_called_once()
+
+        with patch.object(api, "async_track_time_interval") as interval:
+            device.async_start(None)
+        interval.assert_not_called()
+
+    async def test_status_binary_sensors_follow_device_status(self):
+        device = SimpleNamespace(
+            status=None, available=True, add_listener=lambda _listener: lambda: None
+        )
+        entry = SimpleNamespace(data={CONF_ADDRESS: "AA:BB"}, runtime_data=device)
+        door = EntrStatusBinarySensor(
+            entry, "door", "Door", _door_open, BinarySensorDeviceClass.DOOR
+        )
+        with (
+            patch.object(RestoreEntity, "async_added_to_hass", AsyncMock()),
+            patch.object(
+                door,
+                "async_get_last_state",
+                AsyncMock(return_value=SimpleNamespace(state="on")),
+            ),
+            patch.object(door, "async_on_remove"),
+            patch.object(door, "async_write_ha_state"),
+        ):
+            await door.async_added_to_hass()
+            self.assertTrue(door.is_on)
+            device.status = decode_status(0, 50, None)
+            door._update_state()
+            self.assertFalse(door.is_on)
+            device.status = decode_status(0x10, 50, None)
+            door._update_state()
+            self.assertTrue(door.is_on)
+        self.assertEqual(door.unique_id, "AA:BB_door")
+
+    async def test_options_flow_defaults_and_stores_scan_interval(self):
+        flow = config_flow.EntrConfigFlow.async_get_options_flow(
+            cast(config_flow.config_entries.ConfigEntry, object())
+        )
+        entry = SimpleNamespace(options={})
+        with patch.object(
+            type(flow), "config_entry", new_callable=PropertyMock, return_value=entry
+        ):
+            result = await flow.async_step_init()
+            schema = result.get("data_schema")
+            assert schema is not None
+            self.assertEqual(schema({CONF_SCAN_INTERVAL: 5}), {CONF_SCAN_INTERVAL: 5})
+            result = await flow.async_step_init({CONF_SCAN_INTERVAL: 0})
+        self.assertEqual(result.get("data"), {CONF_SCAN_INTERVAL: 0})
 
 
 if __name__ == "__main__":

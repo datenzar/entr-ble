@@ -1,6 +1,6 @@
 # ENTR BLE · Home Assistant
 
-**Control your ENTR Bluetooth lock from Home Assistant.** Add a lock entity, battery sensor, and direct control buttons using this HACS custom integration.
+**Control your ENTR Bluetooth lock from Home Assistant.** Add a lock entity, battery and door sensors, and direct control buttons using this HACS custom integration.
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/johannlejeune/entr-ble)
 ![Integration usage](https://img.shields.io/badge/dynamic/json?color=41BDF5&logo=home-assistant&label=integration%20usage&suffix=%20installs&cacheSeconds=15600&url=https://analytics.home-assistant.io/custom_integrations.json&query=$.entr_ble.total)
@@ -60,6 +60,8 @@ Export does not connect to the lock or alter credentials. The integration stores
 | --- | --- |
 | Lock | Standard lock/unlock actions and displayed lock state |
 | Battery sensor | Battery level from the latest successful BLE read |
+| Door sensor | Door open/closed as reported by the lock's door sensor |
+| Charging and Auto-lock sensors, under Diagnostics | Whether the battery is charging and whether auto-lock is enabled |
 | Lock button | Send a lock command regardless of displayed state |
 | Unlock button | Send an unlock command regardless of displayed state |
 | Sync button, under Diagnostics | Read the lock's reported state and battery |
@@ -74,11 +76,14 @@ target:
 
 ## How state updates
 
-After a restart, the integration restores the last displayed values, performs one background BLE read, and disconnects. A successful read replaces the restored state and updates the battery. A failed read leaves the displayed values unchanged.
+After a restart, the integration restores the last displayed values and performs one background BLE read. Every connection is closed after use.
 
-Further BLE connections happen for a command or a manual **Sync**. The integration does not periodically poll the lock and closes each connection after use.
+- **Polling.** The lock is read in the background every 10 minutes by default. Change the interval under **Settings → Devices & services → ENTR BLE → Configure**; `0` disables polling. Each read is a short Bluetooth connection, so shorter intervals use more lock battery.
+- **Commands.** After Lock or Unlock is accepted, the lock entity shows the commanded state immediately, then the lock's own report once the motor has stopped (for example, a bolt that could not extend shows as unlocked).
+- **Auto-lock.** When auto-lock is enabled, the lock re-locks on its own after an unlock. The integration reads it again 30 s, 1, 2 and 4 minutes later and stops as soon as it reports locked.
+- **Availability.** Entities become unavailable when no Bluetooth adapter or proxy has seen the lock advertise for a while, or when the lock cannot be found for a command. They come back, with a fresh read, when it advertises again. A failed read keeps the last values and logs one warning until the lock responds again.
 
-After a successful Lock or Unlock command, it displays the commanded state. **Sync** replaces it with the lock's reported state, which can be stale after manual operation. Use the direct buttons or `lock.open` when you need to send a command regardless of the displayed state. See [protocol notes](../../docs/PROTOCOL.md) for the observed firmware limitations.
+Connections go through Home Assistant's Bluetooth stack, retrying and choosing whichever adapter or ESPHome Bluetooth proxy sees the lock best. The lock's reported state can be stale after manual operation; use the direct buttons or `lock.open` when you need to send a command regardless of the displayed state. See [protocol notes](../../docs/PROTOCOL.md) for the observed firmware limitations.
 
 ## Troubleshooting
 
@@ -89,7 +94,8 @@ After a successful Lock or Unlock command, it displays the commanded state. **Sy
 | Setup code rejected | Check the code and access method; new-lock initialization only applies to an uninitialized lock |
 | Import rejected | Export again for the same address and paste the complete JSON |
 | Displayed state is unexpected | Use Sync to request a read; use a direct button if the lock reports stale state |
-| Values remain after a failed read | They are retained values from an earlier read or command; they do not confirm current reachability |
+| Values remain after a failed read | They are retained values from an earlier read or command; a warning in the log tells you the lock is not responding |
+| Entities unavailable | No Bluetooth adapter or proxy currently sees the lock; add an ESPHome Bluetooth proxy near the door |
 
 [Report an issue](https://github.com/johannlejeune/entr-ble/issues) with your Home Assistant and integration versions, lock model/firmware, action attempted, and error. Remove credentials and passwords from logs or screenshots.
 

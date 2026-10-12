@@ -2,12 +2,12 @@ import os
 from contextlib import suppress
 
 from bleak.exc import BleakError
-from homeassistant.components import bluetooth
 
-from entr_ble import EntrLockClient, EntrProtocolError
+from entr_ble import EntrProtocolError
 from entr_ble.client import build_lock_name, user_id_bytes
 from entr_ble.const import ROLE_OWNER
 
+from . import connection
 from .const import (
     CONF_ADDRESS,
     CONF_AES_KEY,
@@ -32,16 +32,9 @@ async def async_provision(hass, address, method, code, lock_name=None):
             raise ValueError("A lock name is required")
         encoded_name = build_lock_name(lock_name)
 
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, address, connectable=True
-    )
-    if ble_device is None:
-        raise BleakError(f"Lock {address} is not in Bluetooth range")
-
-    client = EntrLockClient(ble_device, timeout=15)
     app_id = os.urandom(16)
+    client = await connection.async_connect(hass, address)
     try:
-        await client.connect()
         await client.fetch_comm_version()
         await client.pair()
         await client.handshake(app_id)

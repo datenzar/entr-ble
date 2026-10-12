@@ -106,5 +106,18 @@
       "invalid_input": "Check the code and lock name.",
       "pairing_rejected": "The lock rejected the code or setup method."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ENTR lock options",
+        "data": {
+          "scan_interval": "Status refresh interval"
+        },
+        "data_description": {
+          "scan_interval": "Minutes between background status reads (lock state, door, battery). Each read briefly connects over Bluetooth and uses some lock battery. Set to 0 to only read after commands and when the lock reappears."
+        }
+      }
+    }
   }
 }

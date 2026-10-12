@@ -10,7 +10,7 @@
   ],
   "documentation": "https://github.com/johannlejeune/entr-ble/blob/main/custom_components/entr_ble/README.md",
   "integration_type": "device",
-  "iot_class": "assumed_state",
+  "iot_class": "local_polling",
   "issue_tracker": "https://github.com/johannlejeune/entr-ble/issues",
   "requirements": [
     "entr-ble==1.0.0"
