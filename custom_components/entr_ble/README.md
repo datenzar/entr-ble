@@ -9,6 +9,9 @@
 
 This is an independent project, unaffiliated with ASSA ABLOY.
 
+> [!NOTE]
+> **datenzar fork.** This build adds status polling, door/charging sensors, availability tracking, state read-back after commands, auto-lock follow-ups, and connections through `bleak-retry-connector`. It installs the matching `entr-ble` library wheel from this fork's GitHub release instead of PyPI. To use it, add `https://github.com/datenzar/entr-ble` in HACS under **Custom repositories** (category **Integration**) and download the latest `-datenzar` release. Credentials and entities from the upstream integration carry over.
+
 ## Requirements
 
 - **Home Assistant 2026.9.3+** and HACS.
